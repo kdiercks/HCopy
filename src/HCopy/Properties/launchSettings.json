@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "HighPerformanceCopyCLI": {
+      "commandName": "Project",
+      "commandLineArgs": "c:\\temp c:\\temp1 -t 8 -ckbytes 400000000 -verify"
+    }
+  }
+}
