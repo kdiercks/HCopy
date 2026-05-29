@@ -1,6 +1,5 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+using System.Collections.Concurrent;
 
 namespace HighPerfFileCopyLib
 {
@@ -20,12 +19,18 @@ namespace HighPerfFileCopyLib
     {
         public int FilesTotal { get; internal set; }
         public TimeSpan TotalTime { get; internal set; }
-        public List<PerFileStats> FileStats { get; internal set; } = new List<PerFileStats>();
-        public TimeSpan TotalCopyTime => TimeSpan.FromTicks(FileStats.Sum(f => f.CopyTime.Ticks));
-        public TimeSpan TotalChecksumTime => TimeSpan.FromTicks(FileStats.Sum(f => (f.ChecksumTime?.Ticks) ?? 0));
-        public TimeSpan AverageCopyTimePerFile => FilesTotal > 0 ? TimeSpan.FromTicks(TotalCopyTime.Ticks / FilesTotal) : TimeSpan.Zero;
-        public TimeSpan AverageChecksumTimePerFile => (FilesTotal > 0 && FileStats.Any(f => f.ChecksumTime.HasValue))
-            ? TimeSpan.FromTicks(TotalChecksumTime.Ticks / FilesTotal)
+        public ConcurrentBag<PerFileStats> FileStats { get; internal set; } = new ConcurrentBag<PerFileStats>();
+        internal long TotalCopyTicks;
+        internal long TotalChecksumTicks;
+        internal int ChecksumFileCount;
+        internal long TotalBytesCopied;
+
+        public TimeSpan TotalCopyTime => TimeSpan.FromTicks(TotalCopyTicks);
+        public TimeSpan TotalChecksumTime => TimeSpan.FromTicks(TotalChecksumTicks);
+        public long TotalBytes => TotalBytesCopied;
+        public TimeSpan AverageCopyTimePerFile => FilesTotal > 0 ? TimeSpan.FromTicks(TotalCopyTicks / FilesTotal) : TimeSpan.Zero;
+        public TimeSpan AverageChecksumTimePerFile => ChecksumFileCount > 0
+            ? TimeSpan.FromTicks(TotalChecksumTicks / ChecksumFileCount)
             : TimeSpan.Zero;
     }
 }
