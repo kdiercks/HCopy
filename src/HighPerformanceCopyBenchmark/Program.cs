@@ -44,7 +44,7 @@ namespace HighPerfFileCopy.Benchmark
                 var manager = new FileCopyManager(options);
 
                 var sw = Stopwatch.StartNew();
-                var stats = await manager.RunAsync(null, cts.Token);
+                var stats = await manager.RunAsync(perFileProgress: null, overallProgress: null, cancellationToken: cts.Token);
                 sw.Stop();
 
                 Console.WriteLine($"Threads: {tc}");

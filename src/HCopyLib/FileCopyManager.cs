@@ -1,9 +1,9 @@
 ﻿using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -22,10 +22,21 @@ namespace HighPerfFileCopyLib
         private readonly FileCopyOptions _options;
         private readonly ManualResetEventSlim _pauseEvent = new ManualResetEventSlim(true);
         private readonly IChecksumAlgorithm _checksumAlgo;
+        private readonly WildcardMatcher[] _excludeDirectoryMatchers;
+        private readonly WildcardMatcher[] _excludeFileMatchers;
+
+        private readonly record struct FileWorkItem(string SourcePath, string RelativePath, long FileSize);
 
         public FileCopyManager(FileCopyOptions options)
         {
             _options = options ?? throw new ArgumentNullException(nameof(options));
+
+            _excludeDirectoryMatchers = _options.ExcludeDirectoryPatterns
+                .Select(static pattern => new WildcardMatcher(pattern))
+                .ToArray();
+            _excludeFileMatchers = _options.ExcludeFilePatterns
+                .Select(static pattern => new WildcardMatcher(pattern))
+                .ToArray();
 
             _checksumAlgo = _options.ChecksumAlgorithm?.ToUpperInvariant() switch
             {
@@ -59,11 +70,11 @@ namespace HighPerfFileCopyLib
 
             var allFiles = EnumerateFiles(
                 _options.SourceDirectory,
-                _options.ExcludeDirectoryPatterns,
-                _options.ExcludeFilePatterns,
-                cancellationToken).ToList();
+                _excludeDirectoryMatchers,
+                _excludeFileMatchers,
+                cancellationToken).ToArray();
 
-            int totalCount = allFiles.Count;
+            int totalCount = allFiles.Length;
             int filesDone = 0;
 
             var stats = new CopyStatistics
@@ -71,29 +82,34 @@ namespace HighPerfFileCopyLib
                 FilesTotal = totalCount
             };
 
-            var fileQueue = new ConcurrentQueue<string>(allFiles);
+            int nextIndex = -1;
 
             var tasks = new List<Task>();
             for (int i = 0; i < _options.DegreeOfParallelism; i++)
             {
                 tasks.Add(Task.Run(async () =>
                 {
-                    while (!cancellationToken.IsCancellationRequested && fileQueue.TryDequeue(out var srcFile))
+                    while (!cancellationToken.IsCancellationRequested)
                     {
+                        int index = Interlocked.Increment(ref nextIndex);
+                        if (index >= allFiles.Length)
+                            break;
+
+                        var workItem = allFiles[index];
+
                         _pauseEvent.Wait(cancellationToken);
 
                         var perFileStat = new PerFileStats
                         {
-                            FilePath = srcFile,
-                            FileSize = new FileInfo(srcFile).Length
+                            FilePath = workItem.SourcePath,
+                            FileSize = workItem.FileSize
                         };
 
                         try
                         {
-                            var relPath = Path.GetRelativePath(_options.SourceDirectory, srcFile);
-                            var destFile = Path.Combine(_options.DestinationDirectory, relPath);
-                            var destDir = Path.GetDirectoryName(destFile) ?? string.Empty;
-                            if (!Directory.Exists(destDir))
+                            var destFile = Path.Combine(_options.DestinationDirectory, workItem.RelativePath);
+                            var destDir = Path.GetDirectoryName(destFile);
+                            if (!string.IsNullOrEmpty(destDir))
                                 Directory.CreateDirectory(destDir);
 
                             // Copy the file
@@ -104,7 +120,7 @@ namespace HighPerfFileCopyLib
                                 try
                                 {
                                     cancellationToken.ThrowIfCancellationRequested();
-                                    await CopyFileAsync(srcFile, destFile, cancellationToken).ConfigureAwait(false);
+                                    await CopyFileAsync(workItem.SourcePath, destFile, workItem.FileSize, cancellationToken).ConfigureAwait(false);
                                     copied = true;
                                 }
                                 catch (Exception) when (attempt < _options.RetryCount)
@@ -120,7 +136,7 @@ namespace HighPerfFileCopyLib
                             {
                                 Stopwatch swChk = Stopwatch.StartNew();
 
-                                string checksum = await _checksumAlgo.ComputeAsync(srcFile, _options.ChecksumBytes, cancellationToken).ConfigureAwait(false);
+                                string checksum = await _checksumAlgo.ComputeAsync(workItem.SourcePath, _options.ChecksumBytes, cancellationToken).ConfigureAwait(false);
                                 var chkFile = destFile + ".chk";
                                 await File.WriteAllTextAsync(chkFile, checksum, cancellationToken).ConfigureAwait(false);
 
@@ -160,14 +176,22 @@ namespace HighPerfFileCopyLib
                             perFileStat.ChecksumTime = null;
                             perFileProgress?.Report(perFileStat);
                         }
-                        finally
-                        {
-                            stats.FileStats.Add(perFileStat);
-                            int done = Interlocked.Increment(ref filesDone);
-                            overallProgress?.Invoke(new CopyProgress
+                            finally
                             {
-                                FilesCompleted = done,
-                                FilesTotal = totalCount,
+                                stats.FileStats.Add(perFileStat);
+                                Interlocked.Add(ref stats.TotalCopyTicks, perFileStat.CopyTime.Ticks);
+                                Interlocked.Add(ref stats.TotalBytesCopied, perFileStat.FileSize);
+                                if (perFileStat.ChecksumTime.HasValue)
+                                {
+                                    Interlocked.Add(ref stats.TotalChecksumTicks, perFileStat.ChecksumTime.Value.Ticks);
+                                    Interlocked.Increment(ref stats.ChecksumFileCount);
+                                }
+
+                                int done = Interlocked.Increment(ref filesDone);
+                                overallProgress?.Invoke(new CopyProgress
+                                {
+                                    FilesCompleted = done,
+                                    FilesTotal = totalCount,
                                 CurrentFile = perFileStat.FilePath
                             });
                         }
@@ -183,24 +207,29 @@ namespace HighPerfFileCopyLib
             return stats;
         }
 
-        private async Task CopyFileAsync(string sourceFile, string destFile, CancellationToken cancellationToken)
+        private async Task CopyFileAsync(string sourceFile, string destFile, long fileSize, CancellationToken cancellationToken)
         {
-            // If target exists, reset attributes/delete
-            if (File.Exists(destFile))
+            if (OperatingSystem.IsWindows())
             {
                 try
                 {
-                    File.SetAttributes(destFile, FileAttributes.Normal);
-                    File.Delete(destFile);
+                    File.Copy(sourceFile, destFile, overwrite: true);
+
+                    if (_options.CopyTimestampsAndAttributes)
+                    {
+                        File.SetAttributes(destFile, File.GetAttributes(sourceFile));
+                        File.SetCreationTime(destFile, File.GetCreationTime(sourceFile));
+                        File.SetLastAccessTime(destFile, File.GetLastAccessTime(sourceFile));
+                        File.SetLastWriteTime(destFile, File.GetLastWriteTime(sourceFile));
+                    }
+
+                    return;
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    Console.WriteLine($"[ERROR] Failed to prepare target file '{destFile}': {ex.Message}");
-                    throw;
                 }
             }
 
-            long fileSize = new FileInfo(sourceFile).Length;
             int bufferSize;
             if (fileSize < 64 * 1024) bufferSize = 64 * 1024;   // <64KB
             else if (fileSize < 1 * 1024 * 1024) bufferSize = 256 * 1024;  // <1MB
@@ -210,8 +239,27 @@ namespace HighPerfFileCopyLib
 
             try
             {
-                using (var srcStream = new FileStream(sourceFile, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, fileOptions))
-                using (var dstStream = new FileStream(destFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, FileOptions.Asynchronous))
+                var sourceOptions = new FileStreamOptions
+                {
+                    Mode = FileMode.Open,
+                    Access = FileAccess.Read,
+                    Share = FileShare.Read,
+                    BufferSize = bufferSize,
+                    Options = fileOptions
+                };
+
+                var destinationOptions = new FileStreamOptions
+                {
+                    Mode = FileMode.Create,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    BufferSize = bufferSize,
+                    Options = FileOptions.Asynchronous,
+                    PreallocationSize = fileSize
+                };
+
+                using (var srcStream = new FileStream(sourceFile, sourceOptions))
+                using (var dstStream = new FileStream(destFile, destinationOptions))
                 {
                     await srcStream.CopyToAsync(dstStream, bufferSize, cancellationToken).ConfigureAwait(false);
                 }
@@ -241,10 +289,10 @@ namespace HighPerfFileCopyLib
             }
         }
 
-        private static IEnumerable<string> EnumerateFiles(
+        private static IEnumerable<FileWorkItem> EnumerateFiles(
             string root,
-            List<string> excludeDirs,
-            List<string> excludeFilePatterns,
+            WildcardMatcher[] excludeDirs,
+            WildcardMatcher[] excludeFilePatterns,
             CancellationToken cancellationToken)
         {
             var stack = new Stack<string>();
@@ -261,7 +309,7 @@ namespace HighPerfFileCopyLib
                 foreach (var sub in subDirs)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (excludeDirs.Any(p => WildcardMatch(Path.GetFileName(sub), p)))
+                    if (IsExcluded(Path.GetFileName(sub), excludeDirs))
                         continue;
                     stack.Push(sub);
                 }
@@ -273,19 +321,42 @@ namespace HighPerfFileCopyLib
                 foreach (var f in files)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    if (excludeFilePatterns.Any(p => WildcardMatch(Path.GetFileName(f), p)))
+                    if (IsExcluded(Path.GetFileName(f), excludeFilePatterns))
                         continue;
-                    yield return f;
+
+                    yield return new FileWorkItem(
+                        f,
+                        Path.GetRelativePath(root, f),
+                        new FileInfo(f).Length);
                 }
             }
         }
 
-        private static bool WildcardMatch(string text, string pattern)
+        private static bool IsExcluded(string text, WildcardMatcher[] matchers)
         {
-            var regexPattern = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
-                                         .Replace("\\*", ".*")
-                                         .Replace("\\?", ".") + "$";
-            return System.Text.RegularExpressions.Regex.IsMatch(text, regexPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            for (int i = 0; i < matchers.Length; i++)
+            {
+                if (matchers[i].IsMatch(text))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private sealed class WildcardMatcher
+        {
+            private readonly Regex _regex;
+
+            public WildcardMatcher(string pattern)
+            {
+                var regexPattern = "^" + Regex.Escape(pattern)
+                    .Replace("\\*", ".*")
+                    .Replace("\\?", ".") + "$";
+
+                _regex = new Regex(regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+            }
+
+            public bool IsMatch(string text) => _regex.IsMatch(text);
         }
     }
 }

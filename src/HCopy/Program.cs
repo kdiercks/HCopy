@@ -81,7 +81,7 @@ namespace HighPerfFileCopy.ConsoleApp
 
             Console.WriteLine("Press 'p' to pause, 'r' to resume, 'c' to cancel.");
 
-            Task.Run(() =>
+            _ = Task.Run(() =>
             {
                 while (!cts.IsCancellationRequested)
                 {
@@ -105,27 +105,24 @@ namespace HighPerfFileCopy.ConsoleApp
                 }
             });
 
-            var progress = new Progress<PerFileStats>(ps =>
-            {
-                var verificationStatus = ps.VerificationPerformed
-                    ? (ps.VerificationPassed ? "Passed" : "Failed")
-                    : "NotChecked";
-
-                Console.WriteLine($"File: {ps.FilePath}");
-                Console.WriteLine($"  Size: {ps.FileSize:N0} bytes");
-                Console.WriteLine($"  CopyTime: {ps.CopyTime}");
-                Console.WriteLine($"  ChecksumTime: {(ps.ChecksumTime?.ToString() ?? "-")}");
-                Console.WriteLine($"  Verified: {verificationStatus}");
-
-            });
+            var lastProgressWrite = Stopwatch.StartNew();
+            CopyProgress? latestProgress = null;
 
             Console.WriteLine("Starting copy…");
             var overallProgressCallback = new Action<CopyProgress>(cp =>
             {
-                Console.WriteLine($"Progress: {cp.FilesCompleted}/{cp.FilesTotal} ({cp.Percent:F2}%) CurrentFile: {cp.CurrentFile}");
+                latestProgress = cp;
+                if (lastProgressWrite.ElapsedMilliseconds < 250 && cp.FilesCompleted < cp.FilesTotal)
+                    return;
+
+                lastProgressWrite.Restart();
+                Console.Write($"\rProgress: {cp.FilesCompleted}/{cp.FilesTotal} ({cp.Percent:F2}%) {cp.CurrentFile}      ");
             });
 
-            var stats = await manager.RunAsync(perFileProgress: progress, overallProgress: overallProgressCallback, cancellationToken: cts.Token);
+            var stats = await manager.RunAsync(perFileProgress: null, overallProgress: overallProgressCallback, cancellationToken: cts.Token);
+
+            if (latestProgress is not null)
+                Console.WriteLine();
 
 
             Console.WriteLine();
